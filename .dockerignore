@@ -1,0 +1,8 @@
+node_modules
+dist
+story-data
+.env
+.git
+test
+examples
+*.md

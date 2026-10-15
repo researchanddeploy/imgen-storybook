@@ -1,6 +1,6 @@
 import type { ZodError } from "zod";
 
-export type StoryErrorCode = "NOT_FOUND" | "VALIDATION" | "CONFLICT" | "IN_USE" | "PROVIDER";
+export type StoryErrorCode = "NOT_FOUND" | "VALIDATION" | "CONFLICT" | "IN_USE" | "PROVIDER" | "LIMIT" | "CONFIG";
 
 export class StoryEngineError extends Error {
     constructor(
@@ -47,5 +47,28 @@ export class InUseError extends StoryEngineError {
 export class ProviderError extends StoryEngineError {
     constructor(message: string, details?: unknown) {
         super("PROVIDER", message, details);
+    }
+}
+
+export class VersionConflictError extends ConflictError {
+    constructor(kind: string, id: string, expected: number, actual: number | undefined) {
+        super(`${kind} "${id}" was modified concurrently (expected version ${expected}, found ${actual ?? "none"})`, {
+            kind,
+            id,
+            expected,
+            actual,
+        });
+    }
+}
+
+export class LimitExceededError extends StoryEngineError {
+    constructor(message: string, details?: unknown) {
+        super("LIMIT", message, details);
+    }
+}
+
+export class ConfigError extends StoryEngineError {
+    constructor(message: string, details?: unknown) {
+        super("CONFIG", message, details);
     }
 }

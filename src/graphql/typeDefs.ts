@@ -1,3 +1,26 @@
+const ENTITY_FIELDS = /* GraphQL */ `
+  id: ID!
+  kind: EntityKind!
+  "Incremented on every change; pass it as expectedVersion to update safely."
+  version: Int!
+  name: String!
+  description: String!
+  tags: [String!]!
+  promptHint: String
+  references: [ReferenceImage!]!
+  renders(first: Int = 10, after: String): RenderPage!
+  createdAt: String!
+  updatedAt: String!
+`;
+
+const page = (type: string) => /* GraphQL */ `
+type ${type}Page {
+  items: [${type}!]!
+  "Pass as 'after' to get the next page; null on the last page."
+  nextCursor: String
+}
+`;
+
 export const typeDefs = /* GraphQL */ `
 """
 Kind of a user-defined story entity.
@@ -18,15 +41,37 @@ enum OutputFormat {
 }
 
 enum RenderStatus {
+  "Accepted, waiting in the provider queue."
+  QUEUED
+  "Being generated."
+  RUNNING
   SUCCEEDED
   FAILED
+  CANCELED
+}
+
+enum RenderOperation {
+  GENERATE
+  "Edit of an existing render (see parent)."
+  REFINE
+  "Enlarged copy of an existing render (see parent)."
+  UPSCALE
 }
 
 enum RenderMode {
   "No reference images — plain text-to-image."
   TEXT_TO_IMAGE
-  "Reference images attached — image-conditioned generation."
+  "Images attached — image-conditioned generation."
   REFERENCE_TO_IMAGE
+}
+
+enum ReferenceRole {
+  "An entity's reference image."
+  ENTITY
+  "Another page of the story, for visual continuity."
+  CONTINUITY
+  "The image being edited or upscaled."
+  BASE
 }
 
 enum ResizeFit {
@@ -42,6 +87,11 @@ enum ResizeKernel {
   LANCZOS3
 }
 
+enum ToolFormat {
+  ANTHROPIC
+  OPENAI
+}
+
 # ---------------------------------------------------------------------------
 # Output types
 # ---------------------------------------------------------------------------
@@ -52,7 +102,7 @@ A stored image (reference or render).
 type StoredImage {
   key: String!
   mimeType: String!
-  "Public URL, when the storage adapter exposes one."
+  "Public URL, when the server exposes one."
   url: String
   "Inline data: URI. Heavy — request only when no url is available."
   dataUri: String
@@ -61,8 +111,8 @@ type StoredImage {
 }
 
 """
-A user-provided image that defines how an entity looks. References are the source of
-visual consistency: they are attached to every render that features the entity.
+A user-provided image that defines how an entity looks. References are attached to
+every render that features the entity.
 """
 type ReferenceImage {
   id: ID!
@@ -73,23 +123,14 @@ type ReferenceImage {
   "Primary references are sent first and survive reference-budget trimming."
   isPrimary: Boolean!
   mimeType: String!
+  width: Int
+  height: Int
   image: StoredImage!
   createdAt: String!
 }
 
 interface Entity {
-  id: ID!
-  kind: EntityKind!
-  name: String!
-  description: String!
-  tags: [String!]!
-  "Extra text appended whenever the entity is described in a prompt."
-  promptHint: String
-  references: [ReferenceImage!]!
-  "Renders whose target is this entity, newest first."
-  renders: [Render!]!
-  createdAt: String!
-  updatedAt: String!
+${ENTITY_FIELDS}
 }
 
 type GenerationSettings {
@@ -114,17 +155,7 @@ type Appearance {
 }
 
 type Character implements Entity {
-  id: ID!
-  kind: EntityKind!
-  name: String!
-  description: String!
-  tags: [String!]!
-  promptHint: String
-  references: [ReferenceImage!]!
-  renders: [Render!]!
-  createdAt: String!
-  updatedAt: String!
-
+${ENTITY_FIELDS}
   appearance: Appearance!
   outfit: String
   personality: String
@@ -133,17 +164,7 @@ type Character implements Entity {
 }
 
 type Style implements Entity {
-  id: ID!
-  kind: EntityKind!
-  name: String!
-  description: String!
-  tags: [String!]!
-  promptHint: String
-  references: [ReferenceImage!]!
-  renders: [Render!]!
-  createdAt: String!
-  updatedAt: String!
-
+${ENTITY_FIELDS}
   medium: String
   palette: [String!]!
   lineWork: String
@@ -157,17 +178,7 @@ type Style implements Entity {
 }
 
 type Location implements Entity {
-  id: ID!
-  kind: EntityKind!
-  name: String!
-  description: String!
-  tags: [String!]!
-  promptHint: String
-  references: [ReferenceImage!]!
-  renders: [Render!]!
-  createdAt: String!
-  updatedAt: String!
-
+${ENTITY_FIELDS}
   setting: String
   era: String
   defaultTimeOfDay: String
@@ -177,17 +188,7 @@ type Location implements Entity {
 }
 
 type Accessory implements Entity {
-  id: ID!
-  kind: EntityKind!
-  name: String!
-  description: String!
-  tags: [String!]!
-  promptHint: String
-  references: [ReferenceImage!]!
-  renders: [Render!]!
-  createdAt: String!
-  updatedAt: String!
-
+${ENTITY_FIELDS}
   category: String
   material: String
   colors: [String!]!
@@ -207,6 +208,8 @@ type CastMember {
   accessoryIds: [ID!]!
   accessories: [Accessory!]!
   includeDefaultAccessories: Boolean!
+  "Reference images of the character chosen for this scene (empty = default choice)."
+  referenceIds: [ID!]!
 }
 
 type Camera {
@@ -216,18 +219,21 @@ type Camera {
   composition: String
 }
 
-type Scene implements Entity {
-  id: ID!
-  kind: EntityKind!
-  name: String!
-  description: String!
-  tags: [String!]!
-  promptHint: String
-  references: [ReferenceImage!]!
-  renders: [Render!]!
-  createdAt: String!
-  updatedAt: String!
+type ReferenceSelection {
+  entityKind: EntityKind!
+  entityId: ID!
+  referenceIds: [ID!]!
+}
 
+type Continuity {
+  "Attach the selected illustration of the previous scene in story order."
+  fromPreviousScene: Boolean!
+  "Attach the selected illustrations of these scenes."
+  sceneIds: [ID!]!
+}
+
+type Scene implements Entity {
+${ENTITY_FIELDS}
   storyId: ID
   story: Story
   styleId: ID
@@ -247,22 +253,14 @@ type Scene implements Entity {
   narrative: String
   negative: [String!]!
   generation: GenerationSettings!
+  referenceSelections: [ReferenceSelection!]!
+  continuity: Continuity!
   selectedRenderId: ID
   selectedRender: Render
 }
 
 type Story implements Entity {
-  id: ID!
-  kind: EntityKind!
-  name: String!
-  description: String!
-  tags: [String!]!
-  promptHint: String
-  references: [ReferenceImage!]!
-  renders: [Render!]!
-  createdAt: String!
-  updatedAt: String!
-
+${ENTITY_FIELDS}
   synopsis: String
   audience: String
   styleId: ID
@@ -273,6 +271,14 @@ type Story implements Entity {
   generation: GenerationSettings!
 }
 
+${page("Character")}
+${page("Style")}
+${page("Location")}
+${page("Accessory")}
+${page("Scene")}
+${page("Story")}
+${page("Render")}
+
 type RenderTarget {
   kind: EntityKind!
   id: ID!
@@ -282,9 +288,11 @@ type RenderTarget {
 type RenderReference {
   "1-based position in the image list sent to the model."
   index: Int!
-  entityKind: EntityKind!
-  entityId: ID!
-  referenceId: ID!
+  role: ReferenceRole!
+  entityKind: EntityKind
+  entityId: ID
+  referenceId: ID
+  renderId: ID
   label: String
 }
 
@@ -292,11 +300,27 @@ type RenderParams {
   aspectRatio: String!
   resolution: String!
   outputFormat: OutputFormat!
+  scale: Float
+}
+
+type RenderReview {
+  reviewer: String!
+  "Judged unsuitable for the story's audience."
+  flagged: Boolean!
+  "0-1: how well the image matches its description and references."
+  consistencyScore: Float
+  issues: [String!]!
+  "Set when the reviewer itself failed."
+  error: String
 }
 
 type Render {
   id: ID!
+  version: Int!
   target: RenderTarget!
+  operation: RenderOperation!
+  parentRenderId: ID
+  parent: Render
   status: RenderStatus!
   mode: RenderMode!
   prompt: String!
@@ -307,17 +331,24 @@ type Render {
   image: StoredImage
   sourceUrl: String
   error: String
+  estimatedCostUsd: Float
+  review: RenderReview
   createdAt: String!
+  submittedAt: String
+  completedAt: String
 }
 
 type PlannedReference {
   index: Int!
-  entityKind: EntityKind!
-  entityId: ID!
-  entityName: String!
-  referenceId: ID!
+  role: ReferenceRole!
+  entityKind: EntityKind
+  entityId: ID
+  entityName: String
+  referenceId: ID
+  renderId: ID
   label: String
   view: String
+  description: String
 }
 
 type ResolvedGeneration {
@@ -336,6 +367,11 @@ type ComposedPrompt {
   mode: RenderMode!
   references: [PlannedReference!]!
   generation: ResolvedGeneration!
+}
+
+type SyncResult {
+  checked: Int!
+  completed: Int!
 }
 
 # ---------------------------------------------------------------------------
@@ -384,6 +420,19 @@ input CastMemberInput {
   accessoryIds: [ID!]
   "false drops the character's default accessories in this scene."
   includeDefaultAccessories: Boolean
+  "Which of the character's reference images to use here, in order."
+  referenceIds: [ID!]
+}
+
+input ReferenceSelectionInput {
+  entityKind: EntityKind!
+  entityId: ID!
+  referenceIds: [ID!]!
+}
+
+input ContinuityInput {
+  fromPreviousScene: Boolean
+  sceneIds: [ID!]
 }
 
 "Create inputs: id is optional (generated when omitted)."
@@ -518,6 +567,8 @@ input CreateSceneInput {
   narrative: String
   negative: [String!]
   generation: GenerationSettingsInput
+  referenceSelections: [ReferenceSelectionInput!]
+  continuity: ContinuityInput
 }
 
 input UpdateSceneInput {
@@ -538,6 +589,8 @@ input UpdateSceneInput {
   narrative: String
   negative: [String!]
   generation: GenerationSettingsInput
+  referenceSelections: [ReferenceSelectionInput!]
+  continuity: ContinuityInput
 }
 
 input CreateStoryInput {
@@ -635,6 +688,22 @@ input RenderOptionsInput {
   framing: String
 }
 
+input RefineInput {
+  "What to change, e.g. 'make Ala smile'. Everything else is kept."
+  instructions: String!
+  count: Int
+  generation: GenerationSettingsInput
+  referenceBudget: ReferenceBudgetInput
+  postProcess: PostProcessInput
+}
+
+input UpscaleInput {
+  "Default 2."
+  scale: Float
+  endpoint: String
+  postProcess: PostProcessInput
+}
+
 input PromoteRenderInput {
   renderId: ID!
   kind: EntityKind!
@@ -653,51 +722,57 @@ type Query {
   entity(kind: EntityKind!, id: ID!): Entity
 
   character(id: ID!): Character
-  characters(tag: String): [Character!]!
+  characters(tag: String, first: Int = 50, after: String): CharacterPage!
   style(id: ID!): Style
-  styles(tag: String): [Style!]!
+  styles(tag: String, first: Int = 50, after: String): StylePage!
   location(id: ID!): Location
-  locations(tag: String): [Location!]!
+  locations(tag: String, first: Int = 50, after: String): LocationPage!
   accessory(id: ID!): Accessory
-  accessories(tag: String): [Accessory!]!
+  accessories(tag: String, first: Int = 50, after: String): AccessoryPage!
   scene(id: ID!): Scene
-  scenes(storyId: ID, tag: String): [Scene!]!
+  scenes(storyId: ID, tag: String, first: Int = 50, after: String): ScenePage!
   story(id: ID!): Story
-  stories(tag: String): [Story!]!
+  stories(tag: String, first: Int = 50, after: String): StoryPage!
 
-  render(id: ID!): Render
-  renders(targetKind: EntityKind, targetId: ID): [Render!]!
+  "A pending render is refreshed from the provider unless sync is false."
+  render(id: ID!, sync: Boolean = true): Render
+  "Newest first."
+  renders(targetKind: EntityKind, targetId: ID, status: RenderStatus, first: Int = 20, after: String): RenderPage!
 
   "Dry run of renderScene."
   composeScenePrompt(sceneId: ID!, options: ComposeOptionsInput): ComposedPrompt!
   "Dry run of renderEntityPreview."
   composeEntityPreviewPrompt(kind: EntityKind!, id: ID!, options: ComposeOptionsInput): ComposedPrompt!
+
+  "Tool definitions (JSON) for an LLM agent that drives this API."
+  toolDefinitions(format: ToolFormat = ANTHROPIC): String!
 }
 
 type Mutation {
   createCharacter(input: CreateCharacterInput!): Character!
-  updateCharacter(id: ID!, input: UpdateCharacterInput!): Character!
+  "expectedVersion: fail with CONFLICT if someone else changed it meanwhile."
+  updateCharacter(id: ID!, input: UpdateCharacterInput!, expectedVersion: Int): Character!
   "force: detach from scenes/accessories that reference it instead of failing."
   deleteCharacter(id: ID!, force: Boolean = false): Boolean!
 
   createStyle(input: CreateStyleInput!): Style!
-  updateStyle(id: ID!, input: UpdateStyleInput!): Style!
+  updateStyle(id: ID!, input: UpdateStyleInput!, expectedVersion: Int): Style!
   deleteStyle(id: ID!, force: Boolean = false): Boolean!
 
   createLocation(input: CreateLocationInput!): Location!
-  updateLocation(id: ID!, input: UpdateLocationInput!): Location!
+  updateLocation(id: ID!, input: UpdateLocationInput!, expectedVersion: Int): Location!
   deleteLocation(id: ID!, force: Boolean = false): Boolean!
 
   createAccessory(input: CreateAccessoryInput!): Accessory!
-  updateAccessory(id: ID!, input: UpdateAccessoryInput!): Accessory!
+  updateAccessory(id: ID!, input: UpdateAccessoryInput!, expectedVersion: Int): Accessory!
   deleteAccessory(id: ID!, force: Boolean = false): Boolean!
 
   createScene(input: CreateSceneInput!): Scene!
-  updateScene(id: ID!, input: UpdateSceneInput!): Scene!
+  updateScene(id: ID!, input: UpdateSceneInput!, expectedVersion: Int): Scene!
   deleteScene(id: ID!, force: Boolean = false): Boolean!
 
   createStory(input: CreateStoryInput!): Story!
-  updateStory(id: ID!, input: UpdateStoryInput!): Story!
+  updateStory(id: ID!, input: UpdateStoryInput!, expectedVersion: Int): Story!
   deleteStory(id: ID!, force: Boolean = false): Boolean!
 
   addReferenceImage(input: AddReferenceImageInput!): ReferenceImage!
@@ -705,16 +780,25 @@ type Mutation {
   removeReferenceImage(kind: EntityKind!, entityId: ID!, referenceId: ID!): Boolean!
 
   """
-  Renders the scene with its cast, accessories, location and style, attaching their
-  reference images. Failed generations come back as renders with status FAILED.
-  The first successful render becomes the scene's selected one if none is selected.
+  Queues an illustration of the scene with its cast, accessories, location, style and
+  continuity anchors. Returns immediately with renders in status QUEUED; poll render(id)
+  or wait for the server's webhook. The first successful render becomes the scene's
+  selected one if none is selected.
   """
   renderScene(sceneId: ID!, options: RenderOptionsInput): [Render!]!
-  """
-  Renders a stand-alone image of an entity: a character design, an object, a location
-  establishing shot, a style sample or a story cover.
-  """
+  "Queues a character design, object, location shot, style sample or story cover."
   renderEntityPreview(kind: EntityKind!, id: ID!, options: RenderOptionsInput): [Render!]!
+  "Edits a finished render according to instructions, keeping everything else."
+  refineRender(renderId: ID!, input: RefineInput!): [Render!]!
+  "Enlarges a finished render (e.g. for print)."
+  upscaleRender(renderId: ID!, input: UpscaleInput): Render!
+  "Refreshes a pending render from the provider."
+  syncRender(id: ID!): Render!
+  "Refreshes all pending renders (for schedulers)."
+  syncPendingRenders(limit: Int = 50): SyncResult!
+  cancelRender(id: ID!): Render!
+  "Runs the configured reviewer (moderation + consistency) again."
+  reviewRender(id: ID!): Render!
   "null clears the selection."
   selectSceneRender(sceneId: ID!, renderId: ID): Scene!
   deleteRender(id: ID!): Boolean!

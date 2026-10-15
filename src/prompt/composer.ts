@@ -8,6 +8,7 @@ import type {
     Location,
     OutputFormat,
     ReferenceImage,
+    Render,
     Scene,
     Story,
     Style,
@@ -23,10 +24,17 @@ export interface ReferenceBudget {
 export interface PlannedReference {
     /** 1-based position in the image list ("Image 1"). */
     index: number;
-    entityKind: EntityKind;
-    entityId: string;
-    entityName: string;
-    reference: ReferenceImage;
+    /** entity = an entity's reference image; continuity = another page; base = the image being edited. */
+    role: "entity" | "continuity" | "base";
+    blobKey: string;
+    mimeType: string;
+    entityKind?: EntityKind;
+    entityId?: string;
+    entityName?: string;
+    reference?: ReferenceImage;
+    renderId?: string;
+    /** Human-readable description used in the legend. */
+    description?: string;
 }
 
 export interface ResolvedGeneration {
@@ -52,6 +60,13 @@ export interface ComposeOptions {
     overrides?: GenerationSettings;
     /** Free text appended at the end of the prompt. */
     extraInstructions?: string;
+    /** Number of images placed before the planned references (e.g. 1 for a refinement base image). */
+    indexOffset?: number;
+}
+
+export interface ContinuityAnchor {
+    scene: Scene;
+    render: Render & { image: NonNullable<Render["image"]> };
 }
 
 export interface SceneContext {
@@ -61,25 +76,42 @@ export interface SceneContext {
     location?: Location;
     characters: ReadonlyMap<string, Character>;
     accessories: ReadonlyMap<string, Accessory>;
+    /** Selected illustrations of other pages to keep continuity with. */
+    continuity?: ContinuityAnchor[];
 }
+
+const entityKey = (kind: EntityKind, id: string) => `${kind}:${id}`;
 
 // ---------------------------------------------------------------------------
 // Reference planning
 // ---------------------------------------------------------------------------
 
-function orderedRefs(entity: AnyEntity): ReferenceImage[] {
+/** Explicit reference choices per entity (`kind:id` → reference ids, in order). */
+export type ReferenceSelections = ReadonlyMap<string, readonly string[]>;
+
+function orderedRefs(entity: AnyEntity, selections?: ReferenceSelections): ReferenceImage[] {
+    const chosen = selections?.get(entityKey(entity.kind, entity.id));
+    if (chosen?.length) {
+        const byId = new Map(entity.references.map((r) => [r.id, r]));
+        return chosen.map((id) => byId.get(id)).filter((r): r is ReferenceImage => r !== undefined);
+    }
     return [...entity.references].sort((a, b) => Number(b.isPrimary) - Number(a.isPrimary));
 }
 
 /**
  * Picks reference images for the given entities (in priority order) within the budget.
- * Round-robin: every entity gets its first (primary) image before any entity gets a
- * second one, so a crowded scene never drops a character entirely. The resulting list
- * keeps images of the same entity adjacent.
+ * Round-robin: every entity gets its first (primary or explicitly chosen) image before
+ * any entity gets a second one, so a crowded scene never drops a character entirely.
+ * The resulting list keeps images of the same entity adjacent.
  */
-export function planReferences(entities: AnyEntity[], budget: ReferenceBudget): PlannedReference[] {
-    const unique = [...new Map(entities.map((e) => [`${e.kind}:${e.id}`, e])).values()];
-    const queues = unique.map((e) => ({ entity: e, refs: orderedRefs(e).slice(0, Math.max(0, budget.maxPerEntity)) }));
+export function planReferences(
+    entities: AnyEntity[],
+    budget: ReferenceBudget,
+    selections?: ReferenceSelections,
+    indexOffset = 0,
+): PlannedReference[] {
+    const unique = [...new Map(entities.map((e) => [entityKey(e.kind, e.id), e])).values()];
+    const queues = unique.map((e) => ({ entity: e, refs: orderedRefs(e, selections).slice(0, Math.max(0, budget.maxPerEntity)) }));
     const taken = new Map<string, ReferenceImage[]>();
     let total = 0;
 
@@ -89,7 +121,7 @@ export function planReferences(entities: AnyEntity[], budget: ReferenceBudget): 
             if (total >= budget.maxReferences) break;
             const ref = q.refs[round];
             if (!ref) continue;
-            const key = `${q.entity.kind}:${q.entity.id}`;
+            const key = entityKey(q.entity.kind, q.entity.id);
             taken.set(key, [...(taken.get(key) ?? []), ref]);
             total++;
             progressed = true;
@@ -99,8 +131,17 @@ export function planReferences(entities: AnyEntity[], budget: ReferenceBudget): 
 
     const out: PlannedReference[] = [];
     for (const { entity } of queues) {
-        for (const reference of taken.get(`${entity.kind}:${entity.id}`) ?? []) {
-            out.push({ index: out.length + 1, entityKind: entity.kind, entityId: entity.id, entityName: entity.name, reference });
+        for (const reference of taken.get(entityKey(entity.kind, entity.id)) ?? []) {
+            out.push({
+                index: indexOffset + out.length + 1,
+                role: "entity",
+                blobKey: reference.blobKey,
+                mimeType: reference.mimeType,
+                entityKind: entity.kind,
+                entityId: entity.id,
+                entityName: entity.name,
+                reference,
+            });
         }
     }
     return out;
@@ -173,13 +214,7 @@ function describeAppearance(c: Character): string | undefined {
 }
 
 function describeAccessory(a: Accessory, refs: PlannedReference[]): string {
-    const details = lines(
-        a.description?.trim(),
-        field("material", a.material),
-        field("colors", a.colors),
-        field("size", a.size),
-        a.promptHint,
-    );
+    const details = lines(a.description?.trim(), field("material", a.material), field("colors", a.colors), field("size", a.size), a.promptHint);
     return `${a.name}${imageTag(refs, "accessory", a.id)}${details.length ? ` — ${details.join("; ")}` : ""}`;
 }
 
@@ -199,28 +234,39 @@ function describeLocation(loc: Location, timeOfDay: string | undefined, weather:
     );
 }
 
+const ROLE_NAMES: Record<EntityKind, string> = {
+    character: "character",
+    accessory: "object",
+    location: "location",
+    style: "style sample",
+    scene: "scene",
+    story: "story",
+};
+
 function referenceLegend(refs: PlannedReference[]): string | undefined {
     if (refs.length === 0) return undefined;
-    const roles: Record<EntityKind, string> = {
-        character: "character",
-        accessory: "object",
-        location: "location",
-        style: "style sample",
-        scene: "scene",
-        story: "story",
-    };
     const legend = refs.map((r) => {
-        const extra = lines(r.reference.view, r.reference.label, r.reference.notes).join(" — ");
-        return `Image ${r.index}: ${roles[r.entityKind]} "${r.entityName}"${extra ? ` (${extra})` : ""}`;
+        if (r.role === "base") return `Image ${r.index}: the current illustration to edit`;
+        if (r.role === "continuity") return `Image ${r.index}: ${r.description ?? "another page of this story"} (continuity anchor)`;
+        const extra = lines(r.reference?.view, r.reference?.label, r.reference?.notes).join(" — ");
+        return `Image ${r.index}: ${ROLE_NAMES[r.entityKind!]} "${r.entityName}"${extra ? ` (${extra})` : ""}`;
     });
-    const rules = [
-        "Character, object and location images are the ground truth for identity and design: keep faces, hairstyles, body proportions, colors, outfits and distinctive details identical to them.",
-        "Do not copy the backgrounds, poses or framing of the reference images unless the description asks for it.",
-    ];
+    const rules: string[] = [];
+    if (refs.some((r) => r.role === "entity" && r.entityKind !== "style")) {
+        rules.push(
+            "Character, object and location images are the ground truth for identity and design: keep faces, hairstyles, body proportions, colors, outfits and distinctive details identical to them.",
+            "Do not copy the backgrounds, poses or framing of the reference images unless the description asks for it.",
+        );
+    }
     if (refs.some((r) => r.entityKind === "style")) {
         rules.push("Style samples define only the rendering technique, palette and line quality — never copy their content.");
     }
-    return `${section("REFERENCE IMAGES (attached in this order):", legend)}\n${rules.join("\n")}`;
+    if (refs.some((r) => r.role === "continuity")) {
+        rules.push(
+            "Continuity anchors are other pages of the same book: keep rendering, palette, lighting and recurring details consistent with them, but compose this scene fresh.",
+        );
+    }
+    return `${section("REFERENCE IMAGES (attached in this order):", legend)}${rules.length ? `\n${rules.join("\n")}` : ""}`;
 }
 
 function constraints(style: Style | undefined, negatives: string[]): string | undefined {
@@ -254,8 +300,17 @@ export function accessoryIdsForCastMember(member: CastMember, character: Charact
     return [...new Set([...defaults, ...(member.accessoryIds ?? [])])];
 }
 
+/** Scene-level reference choices: `scene.referenceSelections` plus each cast member's `referenceIds`. */
+export function sceneSelections(scene: Scene): Map<string, string[]> {
+    const map = new Map<string, string[]>();
+    for (const s of scene.referenceSelections) map.set(entityKey(s.entityKind, s.entityId), s.referenceIds);
+    for (const m of scene.cast) if (m.referenceIds?.length) map.set(entityKey("character", m.characterId), m.referenceIds);
+    return map;
+}
+
 export function composeScenePrompt(ctx: SceneContext, options: ComposeOptions): ComposedPrompt {
     const { scene, story, style, location } = ctx;
+    const offset = options.indexOffset ?? 0;
 
     const castEntries = scene.cast
         .map((member) => ({ member, character: ctx.characters.get(member.characterId) }))
@@ -274,16 +329,25 @@ export function composeScenePrompt(ctx: SceneContext, options: ComposeOptions): 
         .map((id) => ctx.accessories.get(id))
         .filter((a): a is Accessory => a !== undefined);
 
-    const refs = planReferences(
-        [
-            ...castEntries.map((e) => e.character),
-            ...castAccessories.flat(),
-            ...sceneProps,
-            ...(location ? [location] : []),
-            ...(style ? [style] : []),
-        ],
-        options.budget,
+    // Continuity anchors get at most a third of the budget and never crowd out entity references.
+    const continuity = (ctx.continuity ?? []).slice(0, Math.max(0, Math.floor(options.budget.maxReferences / 3)));
+    const entityRefs = planReferences(
+        [...castEntries.map((e) => e.character), ...castAccessories.flat(), ...sceneProps, ...(location ? [location] : []), ...(style ? [style] : [])],
+        { ...options.budget, maxReferences: options.budget.maxReferences - continuity.length },
+        sceneSelections(scene),
+        offset,
     );
+    const refs: PlannedReference[] = [
+        ...entityRefs,
+        ...continuity.map((c, i) => ({
+            index: offset + entityRefs.length + i + 1,
+            role: "continuity" as const,
+            blobKey: c.render.image.blobKey,
+            mimeType: c.render.image.mimeType,
+            renderId: c.render.id,
+            description: `page "${c.scene.name}"`,
+        })),
+    ];
 
     const characterBlocks = castEntries.map(({ member, character }, i) => {
         const items = castAccessories[i] ?? [];
@@ -320,9 +384,7 @@ export function composeScenePrompt(ctx: SceneContext, options: ComposeOptions): 
         story?.audience && `Intended audience: ${story.audience} — keep the imagery age-appropriate.`,
         referenceLegend(refs),
         describeStyle(style),
-        location
-            ? describeLocation(location, timeOfDay, weather, refs)
-            : section("SETTING:", lines(field("Time of day", timeOfDay), field("Weather", weather))),
+        location ? describeLocation(location, timeOfDay, weather, refs) : section("SETTING:", lines(field("Time of day", timeOfDay), field("Weather", weather))),
         castCount > 0 &&
             `CHARACTERS — exactly ${castCount} ${castCount === 1 ? "character appears" : "characters appear"}, each exactly once:\n${characterBlocks.join("\n")}`,
         sceneProps.length > 0 && section("PROPS IN THE SCENE:", sceneProps.map((a) => describeAccessory(a, refs))),
@@ -332,16 +394,39 @@ export function composeScenePrompt(ctx: SceneContext, options: ComposeOptions): 
         options.extraInstructions,
     );
 
-    const generation = resolveGeneration(
-        [style?.generation, story?.generation, scene.generation, options.overrides],
-        options.defaults,
-    );
-
     return {
         prompt: blocks.join("\n\n"),
-        mode: refs.length > 0 ? "reference-to-image" : "text-to-image",
+        mode: refs.length > 0 || offset > 0 ? "reference-to-image" : "text-to-image",
         references: refs,
-        generation,
+        generation: resolveGeneration([style?.generation, story?.generation, scene.generation, options.overrides], options.defaults),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Refinement of an existing render
+// ---------------------------------------------------------------------------
+
+/**
+ * Wraps a composition (built with `indexOffset: 1`) into an edit instruction for the
+ * image being refined, which becomes Image 1.
+ */
+export function composeRefinementPrompt(
+    base: { blobKey: string; mimeType: string; renderId: string },
+    composed: ComposedPrompt,
+    instructions: string,
+): ComposedPrompt {
+    const header = [
+        "Edit Image 1 — the current illustration — and apply ONLY this change:",
+        instructions.trim(),
+        "",
+        "Keep everything else exactly as in Image 1: composition, framing, characters, poses, colors and art style.",
+        "The description below is the original brief for this illustration; use it and the other reference images to keep everything consistent.",
+    ].join("\n");
+    return {
+        ...composed,
+        mode: "reference-to-image",
+        prompt: `${header}\n\n---\n\n${composed.prompt}`,
+        references: [{ index: 1, role: "base", blobKey: base.blobKey, mimeType: base.mimeType, renderId: base.renderId }, ...composed.references],
     };
 }
 
@@ -361,8 +446,7 @@ export interface PreviewContext {
 const DEFAULT_PREVIEW_FRAMING: Record<EntityKind, string> = {
     character:
         "Character design reference: one full-body view of the character, neutral relaxed standing pose facing the viewer, plain light neutral background, even soft lighting, nothing else in frame.",
-    accessory:
-        "Object design reference: the object alone, centered and fully visible, three-quarter view, plain light neutral background, even soft lighting.",
+    accessory: "Object design reference: the object alone, centered and fully visible, three-quarter view, plain light neutral background, even soft lighting.",
     location: "Establishing wide shot of the location, no characters, showing its key features clearly.",
     style: "A sample illustration that showcases this art style: a cozy cottage at the edge of a forest, with a winding path and a few flowers.",
     scene: "",
@@ -376,8 +460,9 @@ export function composeEntityPreviewPrompt(ctx: PreviewContext, options: Compose
 
     const refs = planReferences(
         [entity, ...accessories, ...characters, ...(style && style.id !== entity.id ? [style] : [])],
-        // An entity's own preview may use its full per-entity budget plus others.
         options.budget,
+        undefined,
+        options.indexOffset ?? 0,
     );
 
     let subject: string | undefined;
@@ -408,7 +493,9 @@ export function composeEntityPreviewPrompt(ctx: PreviewContext, options: Compose
                     sentence(entity.synopsis ?? entity.description),
                     entity.audience && `Intended audience: ${entity.audience} — keep the imagery age-appropriate.`,
                     characters.length > 0 &&
-                        `Featured characters: ${characters.map((c) => `${c.name}${imageTag(refs, "character", c.id)}${c.description ? ` — ${c.description}` : ""}`).join("; ")}`,
+                        `Featured characters: ${characters
+                            .map((c) => `${c.name}${imageTag(refs, "character", c.id)}${c.description ? ` — ${c.description}` : ""}`)
+                            .join("; ")}`,
                     entity.promptHint,
                 ),
             );
@@ -429,15 +516,13 @@ export function composeEntityPreviewPrompt(ctx: PreviewContext, options: Compose
         options.extraInstructions,
     );
 
-    const generation = resolveGeneration(
-        [effectiveStyle?.generation, entity.kind === "story" ? entity.generation : undefined, options.overrides],
-        options.defaults,
-    );
-
     return {
         prompt: blocks.join("\n\n"),
-        mode: refs.length > 0 ? "reference-to-image" : "text-to-image",
+        mode: refs.length > 0 || (options.indexOffset ?? 0) > 0 ? "reference-to-image" : "text-to-image",
         references: refs,
-        generation,
+        generation: resolveGeneration(
+            [effectiveStyle?.generation, entity.kind === "story" ? entity.generation : undefined, options.overrides],
+            options.defaults,
+        ),
     };
 }

@@ -56,6 +56,12 @@ export const ReferenceImageSchema = z.object({
     notes: text(1000).optional(),
     /** Primary references are always sent first and survive reference-budget trimming. */
     isPrimary: z.boolean(),
+    width: z.number().int().positive().optional(),
+    height: z.number().int().positive().optional(),
+    /** Cached copy in the image provider's storage, so the bytes are uploaded once. */
+    providerUpload: z
+        .object({ provider: z.string(), url: z.string(), uploadedAt: z.string(), expiresAt: z.string().optional() })
+        .optional(),
     createdAt: z.string(),
 });
 export type ReferenceImage = z.output<typeof ReferenceImageSchema>;
@@ -147,6 +153,11 @@ export const CastMemberSchema = z.object({
     accessoryIds: idList().optional(),
     /** Set to false to drop the character's default accessories in this scene. */
     includeDefaultAccessories: z.boolean().optional(),
+    /**
+     * Which of the character's reference images to use in this scene, in order
+     * (e.g. the winter-outfit sheet). Omitted = primary first, then the rest.
+     */
+    referenceIds: idList(10).optional(),
 });
 export type CastMember = z.output<typeof CastMemberSchema>;
 
@@ -160,6 +171,25 @@ export const CameraSchema = z
         composition: text(1000),
     })
     .partial();
+
+/** Chooses specific reference images of any entity in a scene (location, accessory...). */
+export const ReferenceSelectionSchema = z.object({
+    entityKind: z.enum(ENTITY_KINDS),
+    entityId: IdSchema,
+    referenceIds: idList(10),
+});
+export type ReferenceSelection = z.output<typeof ReferenceSelectionSchema>;
+
+/** Visual continuity with other pages: their selected illustrations are attached as anchors. */
+export const ContinuitySchema = z
+    .object({
+        /** Attach the selected illustration of the previous scene in story order. */
+        fromPreviousScene: z.boolean(),
+        /** Attach the selected illustrations of these scenes. */
+        sceneIds: idList(4),
+    })
+    .partial();
+export type Continuity = z.output<typeof ContinuitySchema>;
 
 const sceneFields = {
     ...baseFields,
@@ -178,6 +208,8 @@ const sceneFields = {
     narrative: text(20000),
     negative: textList(),
     generation: GenerationSettingsSchema,
+    referenceSelections: z.array(ReferenceSelectionSchema).max(30),
+    continuity: ContinuitySchema,
 };
 
 const storyFields = {
@@ -252,6 +284,8 @@ export type StoryPatch = z.input<typeof StoryPatchSchema>;
 
 const recordBase = {
     id: IdSchema,
+    /** Incremented on every write; used for optimistic locking. */
+    version: z.number().int().positive().default(1),
     createdAt: z.string(),
     updatedAt: z.string(),
 };
@@ -314,8 +348,13 @@ export const SceneSchema = z.object({
     camera: CameraSchema.default({}),
     negative: textList().default([]),
     generation: GenerationSettingsSchema.default({}),
+    referenceSelections: z.array(ReferenceSelectionSchema).max(30).default([]),
+    continuity: ContinuitySchema.default({}),
     /** The render chosen as this scene's illustration. */
     selectedRenderId: IdSchema.optional(),
+    /** Derived index fields (maintained by the engine, used for queries). */
+    castCharacterIds: idList(12).default([]),
+    usedAccessoryIds: idList(200).default([]),
 });
 
 export const StorySchema = z.object({
@@ -335,21 +374,46 @@ export type Accessory = z.output<typeof AccessorySchema>;
 export type Scene = z.output<typeof SceneSchema>;
 export type Story = z.output<typeof StorySchema>;
 
+export const RENDER_STATUSES = ["queued", "running", "succeeded", "failed", "canceled"] as const;
+export type RenderStatus = (typeof RENDER_STATUSES)[number];
+export const PENDING_RENDER_STATUSES: readonly RenderStatus[] = ["queued", "running"];
+
+export const RENDER_OPERATIONS = ["generate", "refine", "upscale"] as const;
+export type RenderOperation = (typeof RENDER_OPERATIONS)[number];
+
 export const RenderReferenceSchema = z.object({
-    /** 1-based position in the image list sent to the model ("Image 1", "Image 2"...). */
+    /** 1-based position in the image list sent to the model ("Image 1"). */
     index: z.number().int().positive(),
-    entityKind: z.enum(ENTITY_KINDS),
-    entityId: IdSchema,
-    referenceId: IdSchema,
+    /** entity = reference image of an entity; continuity = another page; base = image being edited. */
+    role: z.enum(["entity", "continuity", "base"]),
+    entityKind: z.enum(ENTITY_KINDS).optional(),
+    entityId: IdSchema.optional(),
+    referenceId: IdSchema.optional(),
+    renderId: IdSchema.optional(),
     label: z.string().optional(),
 });
 export type RenderReference = z.output<typeof RenderReferenceSchema>;
 
+export const RenderReviewSchema = z.object({
+    reviewer: z.string(),
+    /** Content judged unsuitable (e.g. for the story's audience). */
+    flagged: z.boolean(),
+    /** 0-1: how well characters/objects match their references. */
+    consistencyScore: z.number().min(0).max(1).optional(),
+    issues: z.array(z.string()).default([]),
+    error: z.string().optional(),
+});
+export type RenderReview = z.output<typeof RenderReviewSchema>;
+
 export const RenderSchema = z.object({
     ...recordBase,
     kind: z.literal("render"),
-    target: z.object({ kind: z.enum(ENTITY_KINDS), id: IdSchema }),
-    status: z.enum(["succeeded", "failed"]),
+    targetKind: z.enum(ENTITY_KINDS),
+    targetId: IdSchema,
+    operation: z.enum(RENDER_OPERATIONS).default("generate"),
+    /** The render this one refines or upscales. */
+    parentRenderId: IdSchema.optional(),
+    status: z.enum(RENDER_STATUSES),
     mode: z.enum(["text-to-image", "reference-to-image"]),
     prompt: z.string(),
     references: z.array(RenderReferenceSchema),
@@ -359,7 +423,16 @@ export const RenderSchema = z.object({
         aspectRatio: z.string(),
         resolution: z.string(),
         outputFormat: z.enum(OUTPUT_FORMATS),
+        scale: z.number().optional(),
     }),
+    /** Provider queue request; several renders share one request when count > 1. */
+    requestId: z.string().optional(),
+    /** Which image of the provider response this render takes. */
+    outputIndex: z.number().int().nonnegative().default(0),
+    /** Secret part of the webhook URL. Never exposed through the API. */
+    webhookToken: z.string().optional(),
+    /** Post-processing to apply once the image arrives. */
+    postProcess: z.record(z.string(), z.unknown()).optional(),
     image: z
         .object({
             blobKey: z.string(),
@@ -371,6 +444,10 @@ export const RenderSchema = z.object({
     /** Provider-hosted URL of the raw output (temporary on most providers). */
     sourceUrl: z.string().optional(),
     error: z.string().optional(),
+    estimatedCostUsd: z.number().nonnegative().optional(),
+    review: RenderReviewSchema.optional(),
+    submittedAt: z.string().optional(),
+    completedAt: z.string().optional(),
 });
 export type Render = z.output<typeof RenderSchema>;
 

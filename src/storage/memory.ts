@@ -1,10 +1,23 @@
 import type { RecordByKind, RecordKind } from "../domain/schemas.js";
-import { assertSafeBlobKey, type BlobStore, type RecordStore, type StorageAdapter, type StoredBlob } from "./types.js";
+import { VersionConflictError } from "../errors.js";
+import {
+    applyQuery,
+    assertSafeBlobKey,
+    type BlobStore,
+    type Page,
+    type PutOptions,
+    type RecordQuery,
+    type RecordStore,
+    type StorageAdapter,
+    type StoredBlob,
+} from "./types.js";
+
+type Stored = { id: string; createdAt: string; version?: number };
 
 export class MemoryRecordStore implements RecordStore {
-    private readonly data = new Map<RecordKind, Map<string, unknown>>();
+    private readonly data = new Map<RecordKind, Map<string, Stored>>();
 
-    private bucket(kind: RecordKind): Map<string, unknown> {
+    private bucket(kind: RecordKind): Map<string, Stored> {
         let b = this.data.get(kind);
         if (!b) {
             b = new Map();
@@ -15,15 +28,28 @@ export class MemoryRecordStore implements RecordStore {
 
     async get<K extends RecordKind>(kind: K, id: string): Promise<RecordByKind[K] | null> {
         const v = this.bucket(kind).get(id);
-        return v === undefined ? null : (structuredClone(v) as RecordByKind[K]);
+        return v === undefined ? null : (structuredClone(v) as unknown as RecordByKind[K]);
     }
 
-    async list<K extends RecordKind>(kind: K): Promise<Array<RecordByKind[K]>> {
-        return [...this.bucket(kind).values()].map((v) => structuredClone(v) as RecordByKind[K]);
+    async getMany<K extends RecordKind>(kind: K, ids: readonly string[]): Promise<Array<RecordByKind[K] | null>> {
+        return Promise.all(ids.map((id) => this.get(kind, id)));
     }
 
-    async put<K extends RecordKind>(kind: K, record: RecordByKind[K]): Promise<void> {
-        this.bucket(kind).set(record.id, structuredClone(record));
+    async query<K extends RecordKind>(kind: K, query?: RecordQuery): Promise<Page<RecordByKind[K]>> {
+        const page = applyQuery([...this.bucket(kind).values()], query);
+        return { ...page, items: page.items.map((v) => structuredClone(v) as unknown as RecordByKind[K]) };
+    }
+
+    async count(kind: RecordKind, query?: RecordQuery): Promise<number> {
+        return applyQuery([...this.bucket(kind).values()], { ...query, limit: undefined, cursor: undefined }).items.length;
+    }
+
+    async put<K extends RecordKind>(kind: K, record: RecordByKind[K], options: PutOptions = {}): Promise<void> {
+        const current = this.bucket(kind).get(record.id);
+        if (options.expectedVersion !== undefined && (current?.version ?? 0) !== options.expectedVersion) {
+            throw new VersionConflictError(kind, record.id, options.expectedVersion, current?.version);
+        }
+        this.bucket(kind).set(record.id, structuredClone(record) as unknown as Stored);
     }
 
     async delete(kind: RecordKind, id: string): Promise<boolean> {

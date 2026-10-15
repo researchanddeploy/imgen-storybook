@@ -4,7 +4,10 @@
   "dependencies": {
     "@fal-ai/client": "^1.10.1",
     "@graphql-tools/schema": "^10.1.4",
+    "dataloader": "^2.2.3",
     "graphql": "^16.14.2",
+    "graphql-yoga": "^5.24.5",
+    "pg": "^8.23.1",
     "sharp": "^0.34.5",
     "zod": "^4.6.7"
   },
@@ -13,13 +16,15 @@
     "typecheck": "tsc -p tsconfig.check.json",
     "test": "vitest run",
     "schema": "tsx scripts/print-schema.ts",
-    "example:server": "tsx examples/server.ts",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "dev": "tsx --env-file-if-exists=.env examples/server.ts",
+    "start": "node dist/server/main.js"
   },
   "description": "Illustrated-story image engine (TS library + GraphQL mutations) built on FAL",
   "devDependencies": {
+    "@electric-sql/pglite": "^0.3.16",
     "@types/node": "^22.20.5",
-    "graphql-yoga": "^5.24.5",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",
     "vitest": "^3.2.7"

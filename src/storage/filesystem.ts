@@ -2,8 +2,21 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { IdSchema, type RecordByKind, type RecordKind } from "../domain/schemas.js";
-import { assertSafeBlobKey, mimeFromKey, type BlobStore, type RecordStore, type StorageAdapter, type StoredBlob } from "./types.js";
+import { VersionConflictError } from "../errors.js";
+import {
+    applyQuery,
+    assertSafeBlobKey,
+    mimeFromKey,
+    type BlobStore,
+    type Page,
+    type PutOptions,
+    type RecordQuery,
+    type RecordStore,
+    type StorageAdapter,
+    type StoredBlob,
+} from "./types.js";
 
+/** Write to a temp file, then rename: readers on a shared volume never see partial files. */
 async function writeAtomic(file: string, data: string | Uint8Array): Promise<void> {
     await fs.mkdir(path.dirname(file), { recursive: true });
     const tmp = `${file}.${randomUUID()}.tmp`;
@@ -30,7 +43,12 @@ async function unlinkIfExists(file: string): Promise<boolean> {
     }
 }
 
-/** Stores each record as `<root>/<kind>/<id>.json`. */
+/**
+ * Stores each record as `<root>/<kind>/<id>.json`. Queries scan the kind's directory,
+ * so this suits up to a few thousand records per kind. The version check is
+ * read-compare-write: it catches stale edits but is not atomic across processes —
+ * use the Postgres adapter when several runners write the same records.
+ */
 export class FileSystemRecordStore implements RecordStore {
     constructor(private readonly root: string) {}
 
@@ -45,7 +63,11 @@ export class FileSystemRecordStore implements RecordStore {
         return buf ? (JSON.parse(buf.toString("utf-8")) as RecordByKind[K]) : null;
     }
 
-    async list<K extends RecordKind>(kind: K): Promise<Array<RecordByKind[K]>> {
+    async getMany<K extends RecordKind>(kind: K, ids: readonly string[]): Promise<Array<RecordByKind[K] | null>> {
+        return Promise.all(ids.map((id) => this.get(kind, id)));
+    }
+
+    private async all<K extends RecordKind>(kind: K): Promise<Array<RecordByKind[K]>> {
         let names: string[];
         try {
             names = await fs.readdir(path.join(this.root, kind));
@@ -53,15 +75,27 @@ export class FileSystemRecordStore implements RecordStore {
             if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
             throw err;
         }
-        const out: Array<RecordByKind[K]> = [];
-        for (const name of names.filter((n) => n.endsWith(".json"))) {
-            const rec = await this.get(kind, name.slice(0, -".json".length));
-            if (rec) out.push(rec);
-        }
-        return out;
+        const records = await Promise.all(
+            names.filter((n) => n.endsWith(".json")).map((n) => this.get(kind, n.slice(0, -".json".length))),
+        );
+        return records.filter((r): r is Awaited<RecordByKind[K]> => r !== null);
     }
 
-    async put<K extends RecordKind>(kind: K, record: RecordByKind[K]): Promise<void> {
+    async query<K extends RecordKind>(kind: K, query?: RecordQuery): Promise<Page<RecordByKind[K]>> {
+        return applyQuery(await this.all(kind), query);
+    }
+
+    async count(kind: RecordKind, query?: RecordQuery): Promise<number> {
+        return applyQuery(await this.all(kind), { ...query, limit: undefined, cursor: undefined }).items.length;
+    }
+
+    async put<K extends RecordKind>(kind: K, record: RecordByKind[K], options: PutOptions = {}): Promise<void> {
+        if (options.expectedVersion !== undefined) {
+            const current = await this.get(kind, record.id);
+            if ((current?.version ?? 0) !== options.expectedVersion) {
+                throw new VersionConflictError(kind, record.id, options.expectedVersion, current?.version);
+            }
+        }
         await writeAtomic(this.file(kind, record.id), JSON.stringify(record, null, 2));
     }
 

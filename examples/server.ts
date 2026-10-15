@@ -1,53 +1,29 @@
 /**
- * Standalone GraphQL server for local development.
+ * Local development server — the same HTTP app that runs on FAL Serverless.
  *
- *   npm run example:server            # uses FAL when FAL_KEY is set, otherwise the mock provider
- *   open http://localhost:4000/graphql
+ *   npm run dev                       # FAL when FAL_KEY is set (not the placeholder), otherwise mock images
+ *   curl localhost:8080/health
+ *   POST http://localhost:8080/graphql  (header x-storybook-token if STORYBOOK_API_TOKEN is set)
  *
- * Data lives in ./story-data. Images are served at /blobs/<key>.
+ * Data lives in ./story-data (override with STORYBOOK_DATA_DIR).
  */
 import { createServer } from "node:http";
-import { createYoga } from "graphql-yoga";
-import { createStoryGraphQLSchema } from "../src/graphql/index.js";
-import {
-    createFalBackgroundRemover,
-    createFalImageProvider,
-    createFileSystemStorage,
-    createMockImageProvider,
-    createStoryEngine,
-} from "../src/index.js";
+import { loadConfig } from "../src/config.js";
+import { createMockImageProvider } from "../src/providers/mock.js";
+import { createStorybookServer } from "../src/server/app.js";
 
-const port = Number(process.env.PORT ?? 4000);
-const hasFal = Boolean(process.env.FAL_KEY ?? process.env.FALAI_API_KEY);
-
-const engine = createStoryEngine({
-    storage: createFileSystemStorage({
-        rootDir: process.env.STORY_DATA_DIR ?? "./story-data",
-        publicBaseUrl: `http://localhost:${port}/blobs`,
-    }),
-    provider: hasFal ? createFalImageProvider({ onLog: (m) => console.log(`[fal] ${m}`) }) : createMockImageProvider(),
-    backgroundRemover: hasFal ? createFalBackgroundRemover() : undefined,
-    defaults: { aspectRatio: "4:3", resolution: "1K" },
+const config = loadConfig({
+    STORYBOOK_DATA_DIR: "./story-data",
+    STORYBOOK_PUBLIC_URL: `http://localhost:${process.env.PORT ?? 8080}`,
+    ...process.env,
+});
+const app = createStorybookServer({
+    config,
+    ...(config.falKey ? {} : { provider: createMockImageProvider({ checksUntilDone: 2 }) }),
 });
 
-const yoga = createYoga({ schema: createStoryGraphQLSchema({ engine }) });
-
-const server = createServer(async (req, res) => {
-    if (req.method === "GET" && req.url?.startsWith("/blobs/")) {
-        const key = decodeURIComponent(req.url.slice("/blobs/".length).split("?")[0] ?? "");
-        try {
-            const blob = await engine.getBlob(key);
-            if (!blob) throw new Error("not found");
-            res.writeHead(200, { "Content-Type": blob.contentType, "Cache-Control": "public, max-age=31536000, immutable" });
-            res.end(blob.data);
-        } catch {
-            res.writeHead(404).end();
-        }
-        return;
-    }
-    return yoga(req, res);
-});
-
-server.listen(port, () => {
-    console.log(`GraphQL: http://localhost:${port}/graphql (provider: ${engine.provider.name})`);
+await app.init();
+app.startPolling();
+createServer((req, res) => void app.handler(req, res)).listen(config.port, () => {
+    console.log(`http://localhost:${config.port}/graphql  (images: ${config.falKey ? "FAL" : "mock — set FAL_KEY for real generation"})`);
 });

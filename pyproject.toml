@@ -1,0 +1,35 @@
+# Deployment of imgen-storybook to FAL Serverless.
+#
+#   pip install fal && fal auth login
+#   fal secrets set FAL_KEY=<your fal key>              # used by the server to call FAL models
+#   fal secrets set STORYBOOK_API_TOKEN=<random secret> # optional second factor, see README
+#   fal deploy imgen-storybook
+#
+# The app runs the Node server from the Dockerfile; FAL forwards traffic to exposed_port.
+# Secrets are exposed to the container as environment variables.
+
+[project]
+name = "imgen-storybook-deploy"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[tool.fal.apps.imgen-storybook]
+# private: callers need a FAL key (Authorization: Key ...). Completion is detected by polling,
+# so no inbound webhooks are needed. See README for the "public" + webhooks variant.
+auth = "private"
+machine_type = "S"
+exposed_port = 8080
+# Keep a warm runner for 5 minutes after the last request so polling can finish renders.
+keep_alive = 300
+min_concurrency = 0
+max_concurrency = 2
+# One Node process handles many concurrent GraphQL requests.
+max_multiplexing = 32
+request_timeout = 120
+startup_timeout = 300
+
+[tool.fal.apps.imgen-storybook.image]
+dockerfile = "Dockerfile"
+
+[tool.fal.apps.imgen-storybook.health_check]
+path = "/health"
