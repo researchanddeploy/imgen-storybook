@@ -1,0 +1,5 @@
+node_modules/
+dist/
+story-data/
+.env
+.DS_Store
